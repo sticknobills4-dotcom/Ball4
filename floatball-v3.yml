@@ -1,0 +1,567 @@
+name: FloatBall V3 Build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p FloatBall
+          cat > FloatBall/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FloatBall"
+          include(":app")
+          EOF
+          mkdir -p FloatBall
+          cat > FloatBall/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p FloatBall
+          cat > FloatBall/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          mkdir -p FloatBall/app
+          cat > FloatBall/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.santhosh.floatball"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.santhosh.floatball"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 3
+                  versionName = "3.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p FloatBall/app/src/main
+          cat > FloatBall/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/ic_menu_camera"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <activity android:name=".AddContactActivity"
+                      android:exported="false"
+                      android:theme="@android:style/Theme.DeviceDefault.Light.Dialog"/>
+
+                  <service android:name=".ShotService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p FloatBall/app/src/main/res/values
+          cat > FloatBall/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">FloatBall</string>
+              <string name="acc_desc">Floating ball tap panna screenshot edukkum</string>
+          </resources>
+          EOF
+          mkdir -p FloatBall/app/src/main/res/xml
+          cat > FloatBall/app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canTakeScreenshot="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100"/>
+          EOF
+          mkdir -p FloatBall/app/src/main/java/com/santhosh/floatball
+          cat > FloatBall/app/src/main/java/com/santhosh/floatball/App.kt <<'EOF'
+          package com.santhosh.floatball
+
+          import android.accessibilityservice.AccessibilityService
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.graphics.RectF
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.text.InputType
+          import android.text.TextUtils
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          // ---------- Contact storage ----------
+          object Contacts {
+              private const val PREF = "fb"
+              private const val KEY = "contacts"
+
+              fun load(c: Context): MutableList<Pair<String, String>> {
+                  val raw = c.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY, "") ?: ""
+                  val out = mutableListOf<Pair<String, String>>()
+                  for (line in raw.split("\n")) {
+                      if (line.isBlank()) continue
+                      val p = line.split("\t")
+                      if (p.size >= 2) out.add(Pair(p[0], p[1]))
+                  }
+                  return out
+              }
+
+              private fun save(c: Context, list: List<Pair<String, String>>) {
+                  val raw = list.joinToString("\n") { it.first + "\t" + it.second }
+                  c.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString(KEY, raw).apply()
+              }
+
+              fun add(c: Context, name: String, number: String) {
+                  val l = load(c); l.add(Pair(name, number)); save(c, l)
+              }
+
+              fun remove(c: Context, index: Int) {
+                  val l = load(c)
+                  if (index in l.indices) { l.removeAt(index); save(c, l) }
+              }
+          }
+
+          // ---------- Angry face ball ----------
+          class FaceView(c: Context) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat()
+                  val cx = w / 2; val cy = h / 2
+                  val bg = Color.parseColor("#0A1C1A")
+                  val r = w / 2 - w * 0.03f
+
+                  p.style = Paint.Style.FILL; p.color = bg
+                  cv.drawCircle(cx, cy, r, p)
+                  p.style = Paint.Style.STROKE; p.strokeWidth = w * 0.05f; p.color = Color.parseColor("#12A596")
+                  cv.drawCircle(cx, cy, r, p)
+
+                  for (s in listOf(-1f, 1f)) {
+                      val ex = cx + s * w * 0.15f
+                      val ey = cy + h * 0.02f
+                      p.style = Paint.Style.FILL; p.color = Color.WHITE
+                      cv.drawOval(RectF(ex - w * 0.11f, ey - h * 0.09f, ex + w * 0.11f, ey + h * 0.09f), p)
+                      p.color = Color.parseColor("#0A1C1A")
+                      cv.drawCircle(ex - s * w * 0.02f, ey + h * 0.02f, w * 0.045f, p)
+                      // angry brow (inner end lower)
+                      p.style = Paint.Style.STROKE; p.strokeWidth = h * 0.10f; p.color = bg
+                      cv.drawLine(ex + s * w * 0.15f, ey - h * 0.15f, ex - s * w * 0.12f, ey - h * 0.01f, p)
+                  }
+                  // frown
+                  p.style = Paint.Style.STROKE; p.strokeWidth = w * 0.03f; p.color = Color.WHITE
+                  p.strokeCap = Paint.Cap.ROUND
+                  cv.drawArc(RectF(cx - w * 0.12f, cy + h * 0.22f, cx + w * 0.12f, cy + h * 0.42f), 200f, 140f, false, p)
+              }
+          }
+
+          class ShotService : AccessibilityService() {
+
+              companion object { var instance: ShotService? = null }
+
+              private var wm: WindowManager? = null
+              private var ball: View? = null
+              private var ballLp: WindowManager.LayoutParams? = null
+              private val extras = mutableListOf<View>()
+              private val ui = Handler(Looper.getMainLooper())
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+                  addBall()
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  removeBall(); instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  removeBall(); instance = null
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              fun toggleBall() { if (ball == null) addBall() else removeBall() }
+
+              private fun overlayLp(w: Int, h: Int) = WindowManager.LayoutParams(
+                  w, h,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                  PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START }
+
+              private fun addBall() {
+                  if (ball != null) return
+                  val w = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val size = dp(56)
+                  val v = FaceView(this)
+                  val lp = overlayLp(size, size).apply { x = dp(4); y = dp(300) }
+                  ballLp = lp
+
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - tx; val dy = e.rawY - ty
+                              if (abs(dx) > 12 || abs(dy) > 12) {
+                                  if (!moved) collapse()
+                                  moved = true
+                              }
+                              if (moved) { lp.x = (sx + dx).toInt(); lp.y = (sy + dy).toInt(); w.updateViewLayout(v, lp) }
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) onBallTap()
+                      }
+                      true
+                  }
+                  w.addView(v, lp)
+                  ball = v
+              }
+
+              private fun removeBall() {
+                  collapse()
+                  val b = ball
+                  if (b != null) {
+                      try { wm?.removeView(b) } catch (e: Exception) {}
+                  }
+                  ball = null
+              }
+
+              // ---------- Menu ----------
+              private fun onBallTap() {
+                  if (extras.isEmpty()) showMain() else collapse()
+              }
+
+              private fun collapse() {
+                  for (v in extras) {
+                      try { wm?.removeView(v) } catch (e: Exception) {}
+                  }
+                  extras.clear()
+              }
+
+              private fun circleBg() = GradientDrawable(
+                  GradientDrawable.Orientation.TL_BR,
+                  intArrayOf(Color.parseColor("#2DC7B5"), Color.parseColor("#0E8F83"))
+              ).apply {
+                  shape = GradientDrawable.OVAL
+                  setStroke(dp(1), Color.parseColor("#66FFFFFF"))
+              }
+
+              private fun place(v: View, cx: Int, cy: Int, w: Int, h: Int, anchorY: Int) {
+                  val dm = resources.displayMetrics
+                  val lp = overlayLp(w, h)
+                  lp.x = cx - w / 2
+                  lp.y = (cy - anchorY).coerceIn(dp(24), dm.heightPixels - h - dp(24))
+                  wm?.addView(v, lp)
+                  extras.add(v)
+              }
+
+              private fun iconBubble(res: Int, cx: Int, cy: Int, action: () -> Unit) {
+                  val s = dp(42)
+                  val v = ImageView(this).apply {
+                      setImageResource(res)
+                      setColorFilter(Color.WHITE)
+                      setPadding(dp(10), dp(10), dp(10), dp(10))
+                      background = circleBg()
+                      setOnClickListener { action() }
+                  }
+                  place(v, cx, cy, s, s, s / 2)
+              }
+
+              private fun contactBubble(name: String, cx: Int, cy: Int, onTap: () -> Unit, onLong: () -> Unit) {
+                  val s = dp(42)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+                  val circle = TextView(this).apply {
+                      text = name.trim().take(1).uppercase()
+                      textSize = 18f
+                      setTextColor(Color.WHITE)
+                      typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      background = circleBg()
+                  }
+                  box.addView(circle, LinearLayout.LayoutParams(s, s))
+                  val pill = TextView(this).apply {
+                      text = name
+                      textSize = 10f
+                      setTextColor(Color.WHITE)
+                      typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      maxLines = 1
+                      ellipsize = TextUtils.TruncateAt.END
+                      gravity = Gravity.CENTER
+                      setPadding(dp(8), dp(2), dp(8), dp(2))
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#E61B2B2A")); cornerRadius = dp(10).toFloat()
+                      }
+                  }
+                  val pl = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  pl.topMargin = dp(3)
+                  box.addView(pill, pl)
+                  box.setOnClickListener { onTap() }
+                  box.setOnLongClickListener { onLong(); true }
+                  place(box, cx, cy, dp(76), dp(70), s / 2)
+              }
+
+              private fun ballCenter(): Pair<Int, Int> {
+                  val lp = ballLp!!
+                  return Pair(lp.x + dp(28), lp.y + dp(28))
+              }
+
+              private fun dir(): Int {
+                  val (bx, _) = ballCenter()
+                  return if (bx > resources.displayMetrics.widthPixels / 2) -1 else 1
+              }
+
+              private fun showMain() {
+                  collapse()
+                  val (bx, by) = ballCenter()
+                  val d = dir()
+                  fun at(dx: Int, dy: Int) = Pair(bx + d * dp(dx), by + dp(dy))
+
+                  at(0, -92).let { iconBubble(android.R.drawable.ic_input_add, it.first, it.second) { openAdd() } }
+                  at(72, -57).let { iconBubble(android.R.drawable.ic_menu_crop, it.first, it.second) { collapse(); shoot() } }
+                  at(89, 22).let { iconBubble(android.R.drawable.ic_menu_agenda, it.first, it.second) { collapse(); openGallery() } }
+                  at(37, 84).let { iconBubble(android.R.drawable.ic_menu_call, it.first, it.second) { showCall() } }
+              }
+
+              private fun showCall() {
+                  collapse()
+                  val (bx, by) = ballCenter()
+                  val d = dir()
+                  val list = Contacts.load(this)
+                  val n = list.size + 1
+                  val step = if (n > 1) minOf(52.0, 160.0 / (n - 1)) else 0.0
+                  val radius = dp(92 + maxOf(0, n - 4) * 14).toDouble()
+
+                  fun pos(i: Int): Pair<Int, Int> {
+                      val ang = Math.toRadians((i - (n - 1) / 2.0) * step)
+                      return Pair(bx + (d * radius * cos(ang)).toInt(), by + (radius * sin(ang)).toInt())
+                  }
+
+                  for ((i, c) in list.withIndex()) {
+                      val p = pos(i)
+                      contactBubble(c.first, p.first, p.second,
+                          { collapse(); dial(c.second) },
+                          {
+                              Contacts.remove(this, i)
+                              toast("Removed " + c.first)
+                              showCall()
+                          })
+                  }
+                  val pp = pos(n - 1)
+                  iconBubble(android.R.drawable.ic_input_add, pp.first, pp.second) { openAdd() }
+                  if (list.isEmpty()) toast("+ press panni contact add pannu")
+              }
+
+              private fun openAdd() {
+                  collapse()
+                  val i = Intent(this, AddContactActivity::class.java)
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  startActivity(i)
+              }
+
+              private fun dial(number: String) {
+                  val i = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number, null))
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  startActivity(i)
+              }
+
+              private fun openGallery() {
+                  try {
+                      val i = Intent(Intent.ACTION_VIEW)
+                      i.setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(i)
+                  } catch (e: Exception) { toast("Gallery open aagala") }
+              }
+
+              // ---------- Screenshot ----------
+              private fun shoot() {
+                  ball?.visibility = View.INVISIBLE
+                  ui.postDelayed({ capture { ball?.visibility = View.VISIBLE } }, 250)
+              }
+
+              private fun capture(onDone: () -> Unit) {
+                  takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+                      object : TakeScreenshotCallback {
+                          override fun onSuccess(r: ScreenshotResult) {
+                              try {
+                                  val hw = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)
+                                  val bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                                  r.hardwareBuffer.close()
+                                  if (bmp != null) save(bmp) else toast("Screenshot failed")
+                              } catch (e: Exception) { toast("Error: " + e.message) }
+                              onDone()
+                          }
+                          override fun onFailure(code: Int) {
+                              toast("Screenshot blocked / failed (" + code + ")")
+                              onDone()
+                          }
+                      })
+              }
+
+              private fun save(bmp: Bitmap) {
+                  val name = "SS_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".png"
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                      put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FloatBall")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                  if (uri == null) { toast("Save failed"); return }
+                  contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                  toast("Saved: Pictures/FloatBall/" + name)
+              }
+
+              private fun toast(m: String) {
+                  ui.post { Toast.makeText(this, m, Toast.LENGTH_SHORT).show() }
+              }
+          }
+
+          // ---------- Add contact dialog ----------
+          class AddContactActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  root.addView(TextView(this).apply { text = "Add contact"; textSize = 20f })
+                  val name = EditText(this).apply {
+                      hint = "Name (Amma, Ravi...)"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+                      setSingleLine()
+                  }
+                  val phone = EditText(this).apply {
+                      hint = "Phone number"
+                      inputType = InputType.TYPE_CLASS_PHONE
+                      setSingleLine()
+                  }
+                  root.addView(name)
+                  root.addView(phone)
+                  root.addView(Button(this).apply {
+                      text = "Save"
+                      setOnClickListener {
+                          val n = name.text.toString().trim()
+                          val p = phone.text.toString().trim()
+                          if (n.isEmpty() || p.isEmpty()) {
+                              Toast.makeText(this@AddContactActivity, "Name & number rendum venum", Toast.LENGTH_SHORT).show()
+                          } else {
+                              Contacts.add(this@AddContactActivity, n, p)
+                              Toast.makeText(this@AddContactActivity, "Saved " + n, Toast.LENGTH_SHORT).show()
+                              finish()
+                          }
+                      }
+                  })
+                  setContentView(root)
+              }
+          }
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  fun btn(t: String, a: () -> Unit) =
+                      root.addView(Button(this).apply { text = t; setOnClickListener { a() } })
+
+                  root.addView(TextView(this).apply {
+                      text = "FloatBall\n\nAccessibility ON pannina ball thaanaga varum.\nBall tap -> menu. Call -> contacts. + -> contact add."
+                      textSize = 18f
+                  })
+                  btn("Accessibility settings (FloatBall ON pannu)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("Ball show / hide") {
+                      val s = ShotService.instance
+                      if (s == null) Toast.makeText(this, "First Accessibility ON pannu", Toast.LENGTH_SHORT).show()
+                      else s.toggleBall()
+                  }
+                  btn("Add contact") { startActivity(Intent(this, AddContactActivity::class.java)) }
+                  setContentView(root)
+              }
+          }
+          EOF
+      - name: Build debug APK
+        working-directory: FloatBall
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FloatBall-apk
+          path: FloatBall/app/build/outputs/apk/debug/*.apk
